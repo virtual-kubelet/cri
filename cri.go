@@ -1,5 +1,3 @@
-// +build linux
-
 package cri
 
 import (
@@ -13,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -822,16 +819,6 @@ func (p *CRIProvider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
 	}
 
 	return pods, nil
-}
-
-// Find the total memory in the guest OS
-func getSystemTotalMemory() uint64 {
-	in := &syscall.Sysinfo_t{}
-	err := syscall.Sysinfo(in)
-	if err != nil {
-		return 0
-	}
-	return uint64(in.Totalram) * uint64(in.Unit)
 }
 
 // Provider function to return the capacity of the node
