@@ -14,10 +14,9 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/virtual-kubelet/node-cli/manager"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
-	"github.com/virtual-kubelet/virtual-kubelet/manager"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
-	"github.com/virtual-kubelet/virtual-kubelet/providers"
 	"google.golang.org/grpc"
 	v1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
@@ -41,10 +40,10 @@ const PodConfigMapVolPerms = 0755
 const PodConfigMapVolDir = "/configmaps"
 const PodConfigMapFilePerms = 0644
 
-// CRIProvider implements the virtual-kubelet provider interface and manages pods in a CRI runtime
-// NOTE: CRIProvider is not inteded as an alternative to Kubelet, rather it's intended for testing and POC purposes
+// Provider implements the virtual-kubelet provider interface and manages pods in a CRI runtime
+// NOTE: Provider is not inteded as an alternative to Kubelet, rather it's intended for testing and POC purposes
 //       As such, it is far from functionally complete and never will be. It provides the minimum function necessary
-type CRIProvider struct {
+type Provider struct {
 	resourceManager    *manager.ResourceManager
 	podLogRoot         string
 	podVolRoot         string
@@ -65,7 +64,7 @@ type CRIPod struct {
 
 // Build an internal representation of the state of the pods and containers on the node
 // Call this at the start of every function that needs to read any pod or container state
-func (p *CRIProvider) refreshNodeState() error {
+func (p *Provider) refreshNodeState() error {
 	allPods, err := getPodSandboxes(p.runtimeClient)
 	if err != nil {
 		return err
@@ -135,13 +134,13 @@ func getClientConnection(criSocketPath string) (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
-// Create a new CRIProvider
-func NewCRIProvider(nodeName, operatingSystem string, internalIP string, resourceManager *manager.ResourceManager, daemonEndpointPort int32) (*CRIProvider, error) {
+// Create a new Provider
+func NewProvider(nodeName, operatingSystem string, internalIP string, resourceManager *manager.ResourceManager, daemonEndpointPort int32) (*Provider, error) {
 	runtimeClient, imageClient, err := getClientAPIs(CriSocketPath)
 	if err != nil {
 		return nil, err
 	}
-	provider := CRIProvider{
+	provider := Provider{
 		resourceManager:    resourceManager,
 		podLogRoot:         PodLogRoot,
 		podVolRoot:         PodVolRoot,
@@ -487,7 +486,7 @@ func generateContainerConfig(container *v1.Container, pod *v1.Pod, imageRef, pod
 }
 
 // Provider function to create a Pod
-func (p *CRIProvider) CreatePod(ctx context.Context, pod *v1.Pod) error {
+func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	log.Printf("receive CreatePod %q", pod.Name)
 
 	var attempt uint32 // TODO: Track attempts. Currently always 0
@@ -549,14 +548,14 @@ func (p *CRIProvider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 }
 
 // Update is currently not required or even called by VK, so not implemented
-func (p *CRIProvider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
+func (p *Provider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
 	log.Printf("receive UpdatePod %q", pod.Name)
 
 	return nil
 }
 
 // Provider function to delete a pod and its containers
-func (p *CRIProvider) DeletePod(ctx context.Context, pod *v1.Pod) error {
+func (p *Provider) DeletePod(ctx context.Context, pod *v1.Pod) error {
 	log.Printf("receive DeletePod %q", pod.Name)
 
 	err := p.refreshNodeState()
@@ -588,7 +587,7 @@ func (p *CRIProvider) DeletePod(ctx context.Context, pod *v1.Pod) error {
 }
 
 // Provider function to return a Pod spec - mostly used for its status
-func (p *CRIProvider) GetPod(ctx context.Context, namespace, name string) (*v1.Pod, error) {
+func (p *Provider) GetPod(ctx context.Context, namespace, name string) (*v1.Pod, error) {
 	log.Printf("receive GetPod %q", name)
 
 	err := p.refreshNodeState()
@@ -625,7 +624,7 @@ func readLogFile(filename string, opts api.ContainerLogOpts) (io.ReadCloser, err
 }
 
 // Provider function to read the logs of a container
-func (p *CRIProvider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
+func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
 	log.Printf("receive GetContainerLogs %q", containerName)
 
 	err := p.refreshNodeState()
@@ -647,20 +646,20 @@ func (p *CRIProvider) GetContainerLogs(ctx context.Context, namespace, podName, 
 
 // Get full pod name as defined in the provider context
 // TODO: Implementation
-func (p *CRIProvider) GetPodFullName(namespace string, pod string) string {
+func (p *Provider) GetPodFullName(namespace string, pod string) string {
 	return ""
 }
 
 // RunInContainer executes a command in a container in the pod, copying data
 // between in/out/err and the container's stdin/stdout/stderr.
 // TODO: Implementation
-func (p *CRIProvider) RunInContainer(ctx context.Context, namespace, name, container string, cmd []string, attach api.AttachIO) error {
+func (p *Provider) RunInContainer(ctx context.Context, namespace, name, container string, cmd []string, attach api.AttachIO) error {
 	log.Printf("receive ExecInContainer %q\n", container)
 	return nil
 }
 
 // Find a pod by name and namespace. Pods are indexed by UID
-func (p *CRIProvider) findPodByName(namespace, name string) *CRIPod {
+func (p *Provider) findPodByName(namespace, name string) *CRIPod {
 	var found *CRIPod
 
 	for _, pod := range p.podStatus {
@@ -673,7 +672,7 @@ func (p *CRIProvider) findPodByName(namespace, name string) *CRIPod {
 }
 
 // Provider function to return the status of a Pod
-func (p *CRIProvider) GetPodStatus(ctx context.Context, namespace, name string) (*v1.PodStatus, error) {
+func (p *Provider) GetPodStatus(ctx context.Context, namespace, name string) (*v1.PodStatus, error) {
 	log.Printf("receive GetPodStatus %q", name)
 
 	err := p.refreshNodeState()
@@ -804,7 +803,7 @@ func createPodSpecFromCRI(p *CRIPod, nodeName string) *v1.Pod {
 
 // Provider function to return all known pods
 // TODO: Should this be all pods or just running pods?
-func (p *CRIProvider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
+func (p *Provider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
 	log.Printf("receive GetPods")
 
 	var pods []*v1.Pod
@@ -821,8 +820,16 @@ func (p *CRIProvider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
 	return pods, nil
 }
 
+func (p *Provider) ConfigureNode(ctx context.Context, n *v1.Node) {
+	n.Status.Capacity = p.capacity(ctx)
+	n.Status.Conditions = p.nodeConditions()
+	n.Status.Addresses = p.nodeAddresses()
+	n.Status.DaemonEndpoints = p.nodeDaemonEndpoints()
+	n.Status.NodeInfo.OperatingSystem = p.operatingSystem
+}
+
 // Provider function to return the capacity of the node
-func (p *CRIProvider) Capacity(ctx context.Context) v1.ResourceList {
+func (p *Provider) capacity(ctx context.Context) v1.ResourceList {
 	log.Printf("receive Capacity")
 
 	err := p.refreshNodeState()
@@ -844,7 +851,7 @@ func (p *CRIProvider) Capacity(ctx context.Context) v1.ResourceList {
 
 // Provider function to return node conditions
 // TODO: For now, use the same node conditions as the MockProvider
-func (p *CRIProvider) NodeConditions(ctx context.Context) []v1.NodeCondition {
+func (p *Provider) nodeConditions() []v1.NodeCondition {
 	// TODO: Make this configurable
 	return []v1.NodeCondition{
 		{
@@ -892,7 +899,7 @@ func (p *CRIProvider) NodeConditions(ctx context.Context) []v1.NodeCondition {
 }
 
 // Provider function to return a list of node addresses
-func (p *CRIProvider) NodeAddresses(ctx context.Context) []v1.NodeAddress {
+func (p *Provider) nodeAddresses() []v1.NodeAddress {
 	log.Printf("receive NodeAddresses - returning %s", p.internalIP)
 
 	return []v1.NodeAddress{
@@ -904,19 +911,12 @@ func (p *CRIProvider) NodeAddresses(ctx context.Context) []v1.NodeAddress {
 }
 
 // Provider function to return the daemon endpoint
-func (p *CRIProvider) NodeDaemonEndpoints(ctx context.Context) *v1.NodeDaemonEndpoints {
+func (p *Provider) nodeDaemonEndpoints() v1.NodeDaemonEndpoints {
 	log.Printf("receive NodeDaemonEndpoints - returning %v", p.daemonEndpointPort)
 
-	return &v1.NodeDaemonEndpoints{
+	return v1.NodeDaemonEndpoints{
 		KubeletEndpoint: v1.DaemonEndpoint{
 			Port: p.daemonEndpointPort,
 		},
 	}
-}
-
-// Provider function to return the guest OS
-func (p *CRIProvider) OperatingSystem() string {
-	log.Printf("receive OperatingSystem - returning %s", providers.OperatingSystemLinux)
-
-	return providers.OperatingSystemLinux
 }
