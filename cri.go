@@ -8,22 +8,25 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/pkg/errors"
 	"github.com/virtual-kubelet/node-cli/manager"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
+	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
+	"github.com/virtual-kubelet/virtual-kubelet/trace"
 	"google.golang.org/grpc"
 	v1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
-	criapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	criapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // TODO: Make these configurable
@@ -54,6 +57,7 @@ type Provider struct {
 	podStatus          map[types.UID]CRIPod // Indexed by Pod Spec UID
 	runtimeClient      criapi.RuntimeServiceClient
 	imageClient        criapi.ImageServiceClient
+	notifyStatus       func(*v1.Pod)
 }
 
 type CRIPod struct {
@@ -64,8 +68,14 @@ type CRIPod struct {
 
 // Build an internal representation of the state of the pods and containers on the node
 // Call this at the start of every function that needs to read any pod or container state
-func (p *Provider) refreshNodeState() error {
-	allPods, err := getPodSandboxes(p.runtimeClient)
+func (p *Provider) refreshNodeState(ctx context.Context) (retErr error) {
+	ctx, span := trace.StartSpan(ctx, "cri.refreshNodeState")
+	defer span.End()
+	defer func() {
+		span.SetStatus(retErr)
+	}()
+
+	allPods, err := getPodSandboxes(ctx, p.runtimeClient)
 	if err != nil {
 		return err
 	}
@@ -74,19 +84,19 @@ func (p *Provider) refreshNodeState() error {
 	for _, pod := range allPods {
 		psId := pod.Id
 
-		pss, err := getPodSandboxStatus(p.runtimeClient, psId)
+		pss, err := getPodSandboxStatus(ctx, p.runtimeClient, psId)
 		if err != nil {
 			return err
 		}
 
-		containers, err := getContainersForSandbox(p.runtimeClient, psId)
+		containers, err := getContainersForSandbox(ctx, p.runtimeClient, psId)
 		if err != nil {
 			return err
 		}
 
 		var css = make(map[string]*criapi.ContainerStatus)
 		for _, c := range containers {
-			cstatus, err := getContainerCRIStatus(p.runtimeClient, c.Id)
+			cstatus, err := getContainerCRIStatus(ctx, p.runtimeClient, c.Id)
 			if err != nil {
 				return err
 			}
@@ -160,7 +170,9 @@ func NewProvider(nodeName, operatingSystem string, internalIP string, resourceMa
 	if err != nil {
 		return nil, err
 	}
-	return &provider, err
+
+	p := &provider
+	return p, err
 }
 
 // Take the labels from the Pod spec and turn the into a map
@@ -254,28 +266,6 @@ func createPodSandboxLinuxConfig(pod *v1.Pod) *criapi.LinuxPodSandboxConfig {
 	}
 }
 
-// Greate CRI PodSandboxConfig from the Pod spec
-// TODO: This is probably incomplete
-func generatePodSandboxConfig(pod *v1.Pod, logDir string, attempt uint32) (*criapi.PodSandboxConfig, error) {
-	podUID := string(pod.UID)
-	config := &criapi.PodSandboxConfig{
-		Metadata: &criapi.PodSandboxMetadata{
-			Name:      pod.Name,
-			Namespace: pod.Namespace,
-			Uid:       podUID,
-			Attempt:   attempt,
-		},
-		Labels:       createPodLabels(pod),
-		Annotations:  pod.Annotations,
-		LogDirectory: logDir,
-		DnsConfig:    createPodDnsConfig(pod),
-		Hostname:     createPodHostname(pod),
-		PortMappings: createPortMappings(pod),
-		Linux:        createPodSandboxLinuxConfig(pod),
-	}
-	return config, nil
-}
-
 // Convert environment variables to CRI format
 func createCtrEnvVars(in []v1.EnvVar) []*criapi.KeyValue {
 	out := make([]*criapi.KeyValue, len(in))
@@ -327,12 +317,18 @@ func convertMountPropagationToCRI(input *v1.MountPropagationMode) criapi.MountPr
 }
 
 // Create a CRI specification for the container mounts from the Pod and Container specs
-func createCtrMounts(container *v1.Container, pod *v1.Pod, podVolRoot string, rm *manager.ResourceManager) ([]*criapi.Mount, error) {
+func createCtrMounts(ctx context.Context, container *v1.Container, pod *v1.Pod, podVolRoot string, rm *manager.ResourceManager) (ls []*criapi.Mount, retErr error) {
+	ctx, span := trace.StartSpan(ctx, "cri.createCtrMounts")
+	defer span.End()
+	defer func() {
+		span.SetStatus(retErr)
+	}()
+
 	mounts := []*criapi.Mount{}
 	for _, mountSpec := range container.VolumeMounts {
 		podVolSpec := findPodVolumeSpec(pod, mountSpec.Name)
 		if podVolSpec == nil {
-			log.Printf("Container volume mount %s not found in Pod spec", mountSpec.Name)
+			log.G(ctx).Debugf("Container volume mount %s not found in Pod spec", mountSpec.Name)
 			continue
 		}
 		// Common fields to all mount types
@@ -350,7 +346,7 @@ func createCtrMounts(container *v1.Container, pod *v1.Pod, podVolRoot string, rm
 			// TODO: Maybe not the best place to modify the filesystem, but clear enough for now
 			err := os.MkdirAll(newMount.HostPath, PodVolPerms)
 			if err != nil {
-				return nil, fmt.Errorf("Error making emptyDir for path %s: %v", newMount.HostPath, err)
+				return nil, errors.Wrapf(err, "error making emptyDir for path %s", newMount.HostPath)
 			}
 		} else if podVolSpec.Secret != nil {
 			spec := podVolSpec.Secret
@@ -358,14 +354,14 @@ func createCtrMounts(container *v1.Container, pod *v1.Pod, podVolRoot string, rm
 			newMount.HostPath = podSecretDir
 			err := os.MkdirAll(newMount.HostPath, PodSecretVolPerms)
 			if err != nil {
-				return nil, fmt.Errorf("Error making secret dir for path %s: %v", newMount.HostPath, err)
+				return nil, errors.Wrapf(err, "error making secret dir for path %s", newMount.HostPath)
 			}
 			secret, err := rm.GetSecret(spec.SecretName, pod.Namespace)
 			if spec.Optional != nil && !*spec.Optional && k8serr.IsNotFound(err) {
-				return nil, fmt.Errorf("Secret %s is required by Pod %s and does not exist", spec.SecretName, pod.Name)
+				return nil, errors.Errorf("secret %q is required by pod %q and does not exist", spec.SecretName, pod.Name)
 			}
 			if err != nil {
-				return nil, fmt.Errorf("Error getting secret %s from API server: %v", spec.SecretName, err)
+				return nil, errors.Wrapf(err, "error getting secret %s from API server", spec.SecretName)
 			}
 			if secret == nil {
 				continue
@@ -455,52 +451,32 @@ func createCtrLinuxConfig(container *v1.Container, pod *v1.Pod) *criapi.LinuxCon
 	}
 }
 
-// Generate the CRI ContainerConfig from the Pod and container specs
-// TODO: Probably incomplete
-func generateContainerConfig(container *v1.Container, pod *v1.Pod, imageRef, podVolRoot string, rm *manager.ResourceManager, attempt uint32) (*criapi.ContainerConfig, error) {
-	// TODO: Probably incomplete
-	config := &criapi.ContainerConfig{
-		Metadata: &criapi.ContainerMetadata{
-			Name:    container.Name,
-			Attempt: attempt,
-		},
-		Image:       &criapi.ImageSpec{Image: imageRef},
-		Command:     container.Command,
-		Args:        container.Args,
-		WorkingDir:  container.WorkingDir,
-		Envs:        createCtrEnvVars(container.Env),
-		Labels:      createCtrLabels(container, pod),
-		Annotations: createCtrAnnotations(container, pod),
-		Linux:       createCtrLinuxConfig(container, pod),
-		LogPath:     fmt.Sprintf("%s-%d.log", container.Name, attempt),
-		Stdin:       container.Stdin,
-		StdinOnce:   container.StdinOnce,
-		Tty:         container.TTY,
-	}
-	mounts, err := createCtrMounts(container, pod, podVolRoot, rm)
-	if err != nil {
-		return nil, err
-	}
-	config.Mounts = mounts
-	return config, nil
-}
-
 // Provider function to create a Pod
 func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
-	log.Printf("receive CreatePod %q", pod.Name)
+	ctx, span := trace.StartSpan(ctx, "cri.CreatePod")
+	defer span.End()
+	ctx = span.WithFields(ctx, log.Fields{
+		"pod": path.Join(pod.GetNamespace(), pod.GetName()),
+	})
+	err := p.createPod(ctx, pod)
+	span.SetStatus(err)
+	return err
+}
+
+func (p *Provider) createPod(ctx context.Context, pod *v1.Pod) error {
+	log.G(ctx).Debugf("receive CreatePod %q", pod.Name)
 
 	var attempt uint32 // TODO: Track attempts. Currently always 0
 	logPath := filepath.Join(p.podLogRoot, string(pod.UID))
 	volPath := filepath.Join(p.podVolRoot, string(pod.UID))
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return err
 	}
-	pConfig, err := generatePodSandboxConfig(pod, logPath, attempt)
+	pConfig, err := generatePodSandboxConfig(ctx, pod, logPath, attempt)
 	if err != nil {
 		return err
 	}
-	log.Debugf("%v", pConfig)
 	existing := p.findPodByName(pod.Namespace, pod.Name)
 
 	// TODO: Is re-using an existing sandbox with the UID the correct behavior?
@@ -516,7 +492,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 			return err
 		}
 		// TODO: Is there a race here?
-		pId, err = runPodSandbox(p.runtimeClient, pConfig)
+		pId, err = runPodSandbox(ctx, p.runtimeClient, pConfig)
 		if err != nil {
 			return err
 		}
@@ -525,23 +501,22 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	}
 
 	for _, c := range pod.Spec.Containers {
-		log.Printf("Pulling image %s", c.Image)
-		imageRef, err := pullImage(p.imageClient, c.Image)
+		log.G(ctx).Debugf("Pulling image %s", c.Image)
+		imageRef, err := pullImage(ctx, p.imageClient, c.Image)
 		if err != nil {
 			return err
 		}
-		log.Printf("Creating container %s", c.Name)
-		cConfig, err := generateContainerConfig(&c, pod, imageRef, volPath, p.resourceManager, attempt)
-		log.Debugf("%v", cConfig)
+		log.G(ctx).Debugf("Creating container %s", c.Name)
+		cConfig, err := generateContainerConfig(ctx, &c, pod, imageRef, volPath, p.resourceManager, attempt)
 		if err != nil {
 			return err
 		}
-		cId, err := createContainer(p.runtimeClient, cConfig, pConfig, pId)
+		cId, err := createContainer(ctx, p.runtimeClient, cConfig, pConfig, pId)
 		if err != nil {
 			return err
 		}
-		log.Printf("Starting container %s", c.Name)
-		err = startContainer(p.runtimeClient, cId)
+		log.G(ctx).Debugf("Starting container %s", c.Name)
+		err = startContainer(ctx, p.runtimeClient, cId)
 	}
 
 	return err
@@ -549,16 +524,27 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 
 // Update is currently not required or even called by VK, so not implemented
 func (p *Provider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
-	log.Printf("receive UpdatePod %q", pod.Name)
+	log.G(ctx).Debugf("receive UpdatePod %q", pod.Name)
 
 	return nil
 }
 
 // Provider function to delete a pod and its containers
 func (p *Provider) DeletePod(ctx context.Context, pod *v1.Pod) error {
-	log.Printf("receive DeletePod %q", pod.Name)
+	ctx, span := trace.StartSpan(ctx, "cri.DeletePod")
+	defer span.End()
+	ctx = span.WithFields(ctx, log.Fields{
+		"pod": path.Join(pod.GetNamespace(), pod.GetName()),
+	})
+	err := p.deletePod(ctx, pod)
+	span.SetStatus(err)
+	return err
+}
 
-	err := p.refreshNodeState()
+func (p *Provider) deletePod(ctx context.Context, pod *v1.Pod) error {
+	log.G(ctx).Debugf("receive DeletePod %q", pod.Name)
+
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return err
 	}
@@ -569,28 +555,40 @@ func (p *Provider) DeletePod(ctx context.Context, pod *v1.Pod) error {
 	}
 
 	// TODO: Check pod status for running state
-	err = stopPodSandbox(p.runtimeClient, ps.status.Id)
+	err = stopPodSandbox(ctx, p.runtimeClient, ps.status.Id)
 	if err != nil {
 		// Note the error, but shouldn't prevent us trying to delete
-		log.Print(err)
+		log.G(ctx).Debug(err)
 	}
 
 	// Remove any emptyDir volumes
 	// TODO: Is there other cleanup that needs to happen here?
 	err = os.RemoveAll(filepath.Join(p.podVolRoot, string(pod.UID)))
 	if err != nil {
-		log.Print(err)
+		log.G(ctx).Debug(err)
 	}
-	err = removePodSandbox(p.runtimeClient, ps.status.Id)
+	err = removePodSandbox(ctx, p.runtimeClient, ps.status.Id)
 
+	p.notifyStatus(pod)
 	return err
 }
 
 // Provider function to return a Pod spec - mostly used for its status
 func (p *Provider) GetPod(ctx context.Context, namespace, name string) (*v1.Pod, error) {
-	log.Printf("receive GetPod %q", name)
+	ctx, span := trace.StartSpan(ctx, "cri.GetPod")
+	defer span.End()
+	ctx = span.WithFields(ctx, log.Fields{
+		"pod": path.Join(namespace, name),
+	})
+	pod, err := p.getPod(ctx, namespace, name)
+	span.SetStatus(err)
+	return pod, err
+}
 
-	err := p.refreshNodeState()
+func (p *Provider) getPod(ctx context.Context, namespace, name string) (*v1.Pod, error) {
+	log.G(ctx).Debugf("receive GetPod %q", name)
+
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -625,9 +623,9 @@ func readLogFile(filename string, opts api.ContainerLogOpts) (io.ReadCloser, err
 
 // Provider function to read the logs of a container
 func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
-	log.Printf("receive GetContainerLogs %q", containerName)
+	log.G(ctx).Debugf("receive GetContainerLogs %q", containerName)
 
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -644,17 +642,11 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 	return readLogFile(container.LogPath, opts)
 }
 
-// Get full pod name as defined in the provider context
-// TODO: Implementation
-func (p *Provider) GetPodFullName(namespace string, pod string) string {
-	return ""
-}
-
 // RunInContainer executes a command in a container in the pod, copying data
 // between in/out/err and the container's stdin/stdout/stderr.
 // TODO: Implementation
 func (p *Provider) RunInContainer(ctx context.Context, namespace, name, container string, cmd []string, attach api.AttachIO) error {
-	log.Printf("receive ExecInContainer %q\n", container)
+	log.G(ctx).Debugf("receive ExecInContainer %q\n", container)
 	return nil
 }
 
@@ -673,16 +665,27 @@ func (p *Provider) findPodByName(namespace, name string) *CRIPod {
 
 // Provider function to return the status of a Pod
 func (p *Provider) GetPodStatus(ctx context.Context, namespace, name string) (*v1.PodStatus, error) {
-	log.Printf("receive GetPodStatus %q", name)
+	ctx, span := trace.StartSpan(ctx, "cri.GetPodStatus")
+	defer span.End()
+	ctx = span.WithFields(ctx, log.Fields{
+		"pod": path.Join(namespace, name),
+	})
+	pod, err := p.getPodStatus(ctx, namespace, name)
+	span.SetStatus(err)
+	return pod, err
+}
 
-	err := p.refreshNodeState()
+func (p *Provider) getPodStatus(ctx context.Context, namespace, name string) (*v1.PodStatus, error) {
+	log.G(ctx).Debugf("receive GetPodStatus %q", name)
+
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	pod := p.findPodByName(namespace, name)
 	if pod == nil {
-		return nil, errdefs.NotFoundf("Pod %s in namespace %s could not be found on the node", name, namespace)
+		return nil, errdefs.NotFoundf("pod %s in namespace %s could not be found on the node", name, namespace)
 	}
 
 	return createPodStatusFromCRI(pod), nil
@@ -797,18 +800,17 @@ func createPodSpecFromCRI(p *CRIPod, nodeName string) *v1.Pod {
 		Status: *createPodStatusFromCRI(p),
 	}
 
-	//	log.Printf("Created Pod Spec %v", podSpec)
 	return &podSpec
 }
 
 // Provider function to return all known pods
 // TODO: Should this be all pods or just running pods?
 func (p *Provider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
-	log.Printf("receive GetPods")
+	log.G(ctx).Debugf("receive GetPods")
 
 	var pods []*v1.Pod
 
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -830,11 +832,9 @@ func (p *Provider) ConfigureNode(ctx context.Context, n *v1.Node) {
 
 // Provider function to return the capacity of the node
 func (p *Provider) capacity(ctx context.Context) v1.ResourceList {
-	log.Printf("receive Capacity")
-
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
-		log.Printf("Error getting pod status: %v", err)
+		panic(err)
 	}
 
 	var cpuQ resource.Quantity
@@ -900,8 +900,6 @@ func (p *Provider) nodeConditions() []v1.NodeCondition {
 
 // Provider function to return a list of node addresses
 func (p *Provider) nodeAddresses() []v1.NodeAddress {
-	log.Printf("receive NodeAddresses - returning %s", p.internalIP)
-
 	return []v1.NodeAddress{
 		{
 			Type:    "InternalIP",
@@ -912,11 +910,47 @@ func (p *Provider) nodeAddresses() []v1.NodeAddress {
 
 // Provider function to return the daemon endpoint
 func (p *Provider) nodeDaemonEndpoints() v1.NodeDaemonEndpoints {
-	log.Printf("receive NodeDaemonEndpoints - returning %v", p.daemonEndpointPort)
-
 	return v1.NodeDaemonEndpoints{
 		KubeletEndpoint: v1.DaemonEndpoint{
 			Port: p.daemonEndpointPort,
 		},
 	}
+}
+
+func (p *Provider) NotifyPods(ctx context.Context, f func(*v1.Pod)) {
+	p.notifyStatus = f
+	go p.statusLoop(ctx)
+}
+
+func (p *Provider) statusLoop(ctx context.Context) {
+	t := time.NewTimer(5 * time.Second)
+	if !t.Stop() {
+		<-t.C
+	}
+
+	for {
+		t.Reset(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		if err := p.notifyPodStatuses(ctx); err != nil {
+			log.G(ctx).WithError(err).Error("Error updating node statuses")
+		}
+	}
+}
+
+func (p *Provider) notifyPodStatuses(ctx context.Context) error {
+	ls, err := p.GetPods(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, pod := range ls {
+		p.notifyStatus(pod)
+	}
+
+	return nil
 }

@@ -14,13 +14,14 @@ require (
 	github.com/virtual-kubelet/node-cli v0.1.2
 	github.com/virtual-kubelet/virtual-kubelet v1.1.0
 	go.opencensus.io v0.22.0
-	golang.org/x/net v0.0.0-20190613194153-d28f0bde5980
+	golang.org/x/net v0.0.0-20191004110552-13f9640d40b9
 	google.golang.org/appengine v1.5.0 // indirect
-	google.golang.org/grpc v1.21.1
+	google.golang.org/grpc v1.23.1
 	k8s.io/api v0.0.0
 	k8s.io/apimachinery v0.0.0
 	k8s.io/apiserver v0.0.0-20190615170205-3722cb685593 // indirect
 	k8s.io/client-go v11.0.0+incompatible
+	k8s.io/cri-api v0.0.0-20191114225051-381f557272b4
 	k8s.io/klog v0.3.3
 	k8s.io/kubernetes v1.15.2
 	k8s.io/utils v0.0.0-20190607212802-c55fbcfc754a // indirect
