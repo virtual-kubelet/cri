@@ -5,14 +5,13 @@ go 1.12
 require (
 	contrib.go.opencensus.io/exporter/ocagent v0.5.0
 	github.com/docker/spdystream v0.0.0-20181023171402-6480d4af844c // indirect
-	github.com/golang/groupcache v0.0.0-20190129154638-5b532d6fd5ef // indirect
-	github.com/pkg/errors v0.8.1
+	github.com/pkg/errors v0.9.1
 	github.com/sirupsen/logrus v1.4.2
 	github.com/virtual-kubelet/node-cli v0.1.2
 	github.com/virtual-kubelet/virtual-kubelet v1.2.0
-	go.opencensus.io v0.22.0
-	golang.org/x/net v0.0.0-20191004110552-13f9640d40b9
-	google.golang.org/grpc v1.23.1
+	go.opencensus.io v0.24.0
+	golang.org/x/net v0.5.0
+	google.golang.org/grpc v1.53.0
 	k8s.io/api v0.0.0
 	k8s.io/apimachinery v0.0.0
 	k8s.io/client-go v11.0.0+incompatible // indirect
