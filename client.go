@@ -9,7 +9,7 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/trace"
 	"golang.org/x/net/context"
 	v1 "k8s.io/api/core/v1"
-	criapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	criapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 // Call RunPodSandbox on the CRI client

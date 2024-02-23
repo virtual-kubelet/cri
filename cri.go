@@ -26,26 +26,25 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
-	criapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	criapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 // TODO: Make these configurable
-const CriSocketPath = "/run/containerd/containerd.sock"
-const PodLogRoot = "/var/log/vk-cri/"
-const PodVolRoot = "/run/vk-cri/volumes/"
-const PodLogRootPerms = 0755
-const PodVolRootPerms = 0755
-const PodVolPerms = 0755
-const PodSecretVolPerms = 0755
-const PodSecretVolDir = "/secrets"
-const PodSecretFilePerms = 0644
-const PodConfigMapVolPerms = 0755
-const PodConfigMapVolDir = "/configmaps"
-const PodConfigMapFilePerms = 0644
+const (
+	PodLogRoot            = "/var/log/vk-cri/"
+	PodLogRootPerms       = 0755
+	PodVolRootPerms       = 0755
+	PodVolPerms           = 0755
+	PodSecretVolPerms     = 0755
+	PodSecretFilePerms    = 0644
+	PodConfigMapVolPerms  = 0755
+	PodConfigMapFilePerms = 0644
+)
 
 // Provider implements the virtual-kubelet provider interface and manages pods in a CRI runtime
 // NOTE: Provider is not inteded as an alternative to Kubelet, rather it's intended for testing and POC purposes
-//       As such, it is far from functionally complete and never will be. It provides the minimum function necessary
+//
+//	As such, it is far from functionally complete and never will be. It provides the minimum function necessary
 type Provider struct {
 	resourceManager    *manager.ResourceManager
 	podLogRoot         string
